@@ -857,6 +857,540 @@ def forward(self, x, use_sk=True):
 
 ---
 
-**文档生成时间：** 2026-05-28  
-**作者：** AI Assistant  
-**版本：** v1.0
+## 10. 完整数据流程（新增）
+
+### 10.1 原始数据集
+
+```
+来源: Amazon Reviews 2018
+官网: https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/
+
+原始文件格式:
+  Industrial_and_Scientific.json (评论数据)
+  {
+    "reviewerID": "A2X4VPK8ZT5XYZ",
+    "asin": "B000067ZQZ",
+    "overall": 5.0,
+    "reviewText": "This product is great...",
+    "unixReviewTime": 1540000000
+  }
+  
+  meta_Industrial_and_Scientific.json (物品元数据)
+  {
+    "asin": "B000067ZQZ",
+    "title": "SUPCO SPP6 Relay/Capacitor Hard Start Kit",
+    "description": "This is a hard start kit...",
+    "brand": "SUPCO",
+    "categories": [["Industrial & Scientific", "Power Transmission"]]
+  }
+```
+
+### 10.2 数据预处理流程
+
+```
+步骤1: K-core过滤 (amazon18_data_process.py)
+  输入: 原始.json文件
+  过滤规则:
+    - user_k=5: 只保留交互≥5个物品的用户
+    - item_k=5: 只保留被≥5个用户交互的物品
+    - 时间范围: 2016-10 ~ 2018-11
+    - 标题过滤: 删除无标题、HTML标签、过长标题
+  
+  输出:
+    Industrial_and_Scientific.item.json    ← 物品元数据
+    Industrial_and_Scientific.train.inter  ← 训练集交互
+    Industrial_and_Scientific.valid.inter  ← 验证集交互
+    Industrial_and_Scientific.test.inter   ← 测试集交互
+    Industrial_and_Scientific.user2id      ← 用户ID映射
+    Industrial_and_Scientific.item2id      ← 物品ID映射
+
+.inter文件格式 (TSV):
+  user_id:token    item_id_list:token_seq    item_id:token
+  22    117 52 89 130    118
+  869   130              130
+  1959  1154 1153 1155 1156    1157
+
+.item.json格式:
+  {
+    "0": {
+      "title": "SUPCO SPP6 Relay/Capacitor Hard Start Kit...",
+      "description": "This is a hard start kit...",
+      "brand": "SUPCO",
+      "categories": "Industrial & Scientific,Power Transmission"
+    },
+    "1": {...},
+    ...
+    "3685": {...}
+  }
+```
+
+### 10.3 物品嵌入生成
+
+```bash
+# 脚本: rq/text2emb/amazon_text2emb.py
+bash rq/text2emb/amazon_text2emb.sh \
+     --dataset Industrial_and_Scientific \
+     --root ./data/Amazon18/Industrial_and_Scientific \
+     --plm_name qwen \
+     --plm_checkpoint /path/to/Qwen-model
+```
+
+**转换过程:**
+
+```python
+步骤1: 加载物品元数据
+  Industrial_and_Scientific.item.json
+  ↓
+
+步骤2: 提取文本
+  item_text = title + " " + description
+  示例: "SUPCO SPP6 Relay... This is a hard start kit..."
+  ↓
+
+步骤3: Qwen模型提取嵌入
+  encoded = tokenizer(item_text)
+  outputs = model(input_ids, attention_mask)
+  embedding = mean_pooling(outputs.last_hidden_state)  # [2560维]
+  ↓
+
+步骤4: 保存
+  Industrial_and_Scientific.emb-qwen-td.npy
+  shape: (3686, 2560)
+  3686个物品 × 2560维
+```
+
+**关键点:**
+- 数据来源: `.item.json` (K-core过滤后的物品元数据)
+- 文本拼接: `title + description`
+- 提取方法: Mean Pooling (所有token平均，不是[CLS])
+- 文件命名: `.emb-qwen-td` (td=title+description)
+
+### 10.4 RQ-VAE训练与SID生成
+
+```
+步骤3: 训练RQ-VAE (rqvae.py)
+  输入: Industrial_and_Scientific.emb-qwen-td.npy
+  处理: 训练Encoder-Decoder+残差量化
+  输出: best_collision_model.pth
+  
+  过滤规则: ❌ 无过滤！
+  - 包含所有3686个物品
+  - 每个物品只有1条记录（它的2560维嵌入）
+  - 原因: RQ-VAE需要为"所有可能推荐的物品"生成SID
+  ↓
+
+步骤4: 生成SID索引 (generate_indices.py)
+  输入: 3686个物品的嵌入 + 训练好的模型
+  处理:
+    - 第1阶段: argmin生成所有物品的SID
+    - 第2阶段: Sinkhorn处理碰撞物品
+  输出: Industrial_and_Scientific.index.json
+  
+  碰撞率: 9.52% → 0.30% (去重后)
+```
+
+### 10.5 SFT训练集构建
+
+```bash
+# 脚本: convert_dataset.py
+bash convert_dataset.sh
+```
+
+**转换过程:**
+
+```python
+步骤1: 加载.inter文件
+  Industrial_and_Scientific.train.inter
+  user_id \t history_items \t target_item
+  22    117 52 89 130    118
+  ↓
+
+步骤2: 查SID索引
+  index.json["117"] = ['<a_165>', '<b_107>', '<c_44>']
+  index.json["118"] = ['<a_104>', '<b_118>', '<c_176>']
+  ↓
+
+步骤3: 写入CSV
+  Industrial_and_Scientific_5_2016-10-2018-11.csv
+  user_id, history_item_id, item_id, history_item_sid, item_sid
+  A22, [117,52,89,130], 118, ['<a_165>...','...'], '<a_104>...'
+```
+
+**关键点:**
+- SFT训练集的SID是"预处理"好的，不是训练时动态查找
+- CSV文件已经包含SID字符串，sft.py直接读取
+- 如果改了SID索引，需要重新运行convert_dataset.py
+
+### 10.6 数据量对比
+
+| 数据集 | 数据量 | 过滤规则 | 内容 |
+|-------|-------|---------|-----|
+| **原始Amazon** | 500万交互 | 无 | 用户评论+物品元数据 |
+| **K-core过滤后** | 30万交互 | user_k=5, item_k=5 | 高质量交互 |
+| **RQ-VAE训练集** | 3686条 | ❌ 无过滤 | 物品嵌入(2560维) |
+| **.inter文件** | 30万条 | K-core+时间+标题 | 用户交互序列 |
+| **SFT训练集** | 25万条 | 同.inter | 含SID的训练样本 |
+
+**为什么RQ-VAE只有3686条，而SFT有25万条？**
+
+```
+RQ-VAE训练集:
+  - 对象: 物品
+  - 数量: 3686个唯一物品
+  - 每条: 1个物品的2560维嵌入
+  - 去重: ✅ 每个物品1条
+
+SFT训练集:
+  - 对象: 用户-物品交互
+  - 数量: 30万条交互 → 25万条训练样本
+  - 每条: 用户历史SID序列 → 目标SID
+  - 去重: ❌ 同一物品可被多用户交互
+
+放大效应:
+  用户A历史: [1, 2, 3, 4, 5]
+  生成样本:
+    [1] → 2
+    [1, 2] → 3
+    [1, 2, 3] → 4
+    [1, 2, 3, 4] → 5
+  → 5个物品生成4个训练样本！
+```
+
+### 10.7 RQ-VAE模型的生命周期
+
+```
+阶段1: RQ-VAE训练（一次性）
+  输入: 3686个物品的嵌入
+  训练: 47分钟
+  输出: best_collision_model.pth
+  ↓
+
+阶段2: SID生成（一次性）
+  输入: 3686个物品的嵌入
+  模型: best_collision_model.pth
+  处理: 推理 + Sinkhorn去重
+  输出: index.json (物品ID → SID映射)
+  ↓
+
+阶段3: 数据集转换（一次性）
+  输入: .inter文件 + index.json
+  处理: convert_dataset.py 查表
+  输出: SFT训练集CSV (SID已写入)
+  ↓
+
+阶段4: SFT训练（主要训练）
+  输入: SFT训练集CSV
+  模型: Qwen2.5-1.5B-Instruct
+  训练: 4小时
+  输出: SFT微调模型
+  ↓
+
+阶段5: RL训练（主要训练）
+  输入: RL数据集 + SFT模型
+  训练: 强化学习对齐
+  输出: 最终推荐模型
+  ↓
+
+阶段6: 推理部署
+  输入: 用户历史SID序列
+  模型: RL微调后的Qwen
+  输出: 预测下一个SID
+  查找: SID → 物品 (反向查表)
+
+关键: RQ-VAE在阶段2后就"退役"了！
+  ✅ 阶段1-2: RQ-VAE活跃使用
+  ❌ 阶段4-6: RQ-VAE不再使用
+  → SFT/RL/推理只用SID字符串，不用RQ-VAE模型
+```
+
+### 10.8 去重的本质
+
+**去重针对的是哪个数据集？**
+
+```
+✅ 去重的是: 训练RQ-VAE的数据集 (3686个物品的嵌入)
+✅ 去重的是: 这些物品的SID
+❌ 不是: SFT训练集
+
+去重发生在: generate_indices.py (步骤4)
+  输入: 3686个物品 → 3686个SID
+  问题: 9.52%的物品SID相同 (350个物品)
+  处理: Sinkhorn重新分配碰撞物品
+  输出: index.json (碰撞率0.30%)
+
+SFT训练集"间接"使用去重结果:
+  - convert_dataset.py 查index.json
+  - 写入CSV的SID已经是去重后的
+  - sft.py 读取CSV，不需要再去重
+```
+
+**为什么训练好的RQ-VAE还会碰撞？**
+
+```
+原因1: 训练目标 ≠ 碰撞率
+  Loss = recon_loss + quant_loss
+  - recon_loss关注: x_recon ≈ x
+  - quant_loss关注: z_q ≈ z_e
+  - 但都不关注: SID是否唯一！
+
+原因2: 量化必然有误差
+  z_e_A 和 z_e_B 很接近
+  → 它们离同一个码字最近
+  → argmin选了相同的码字
+  → SID相同
+
+原因3: 码书覆盖不完整
+  256个码字无法完美覆盖32维空间
+  → 某些区域"拥挤"，某些"稀疏"
+  → 相似物品容易落到同一区域
+
+去重的作用:
+  不是"修复模型"
+  而是"后处理优化"
+  → 碰撞率9.52% → 0.30%
+  → 改善31倍
+```
+
+---
+
+## 11. 消融实验对比（新增）
+
+### 11.1 RQ-Kmeans实验结果
+
+```bash
+# 实验3.1.2: RQ-Kmeans (FAISS)
+python rq/rqkmeans_faiss.py --dataset Industrial_and_Scientific
+```
+
+**结果:**
+
+| 指标 | RQ-Kmeans | RQ-VAE | 差距 |
+|-----|-----------|--------|-----|
+| **生成碰撞率** | **20.05%** | **9.52%** | RQ-VAE优52% |
+| **训练时间** | 5秒 | 47分钟 | Kmeans快564倍 |
+| **唯一SID数** | 2947/3686 | 3300/3686 | RQ-VAE多10.7% |
+| **码字利用率** | 100% (L1/L2/L3) | 100% | 相同 |
+
+**为什么RQ-Kmeans碰撞率更高？**
+
+```
+1. 随机初始化问题
+   → FAISS用随机初始K-means
+   → 码书分布不均匀
+
+2. 无均衡约束
+   → 热门区域拥挤
+   → 2947个唯一SID < 3686个物品
+
+3. 线性量化
+   → 只能做线性分割
+   → RQ-VAE的非线性Encoder更好
+```
+
+### 11.2 四种方法对比矩阵
+
+| 维度 | RQ-VAE | RQ-Kmeans | 约束RQ-Kmeans | RQ-Kmeans+ |
+|-----|--------|-----------|-------------|------------|
+| **核心方法** | 神经网络 | K-means | 约束K-means | K-means++ |
+| **降维** | Encoder学习 | PCA | PCA | PCA |
+| **量化** | 训练码书 | 聚类 | 约束聚类 | 聚类 |
+| **初始化** | K-means++ | 随机 | 约束 | K-means++ |
+| **碰撞率(预估)** | 9.52% | 20.05% | 5-10% | 8-15% |
+| **训练时间** | 47min | 5sec | 30min | 15min |
+| **重建能力** | ✅ | ❌ | ❌ | ❌ |
+| **码书质量** | 高 | 低 | 中 | 中 |
+
+### 11.3 消融实验的科学价值
+
+```
+控制变量:
+  - 数据集相同 (Industrial_and_Scientific)
+  - 维度相同 (32维)
+  - 码字数量相同 (256×256×256)
+  - 评估指标相同 (碰撞率)
+
+对比维度:
+  1. 非线性 vs 线性 (RQ-VAE vs K-means)
+  2. 随机 vs 智能初始化 (Kmeans vs Kmeans++)
+  3. 无约束 vs 有约束 (Kmeans vs Constrained)
+  4. 端到端 vs 分步 (RQ-VAE vs 其他)
+
+预期结论:
+  - RQ-VAE最优（但最慢）
+  - K-means++性价比最高
+  - 约束K-means分布最均匀
+  - 标准K-means最弱基线
+```
+
+---
+
+## 12. SFT训练配置优化（新增）
+
+### 12.1 GPU资源管理
+
+```bash
+# 查看GPU状态
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv
+
+# 选择空闲GPU
+CUDA_VISIBLE_DEVICES=5,9 bash sft.sh
+```
+
+**关键规则:**
+- CUDA_VISIBLE_DEVICES=5,9 → torchrun中device编号重新映射
+- nproc_per_node=2 → 使用2张卡
+- batch_size=32, micro_batch_size=4 → 每张卡处理4个样本
+
+### 12.2 显存占用分析
+
+**训练配置:**
+```
+模型: Qwen2.5-1.5B-Instruct (1.5B参数)
+精度: BF16 (2字节/参数)
+GPU: 2张 (GPU 5, GPU 9)
+batch_size=32, micro_batch_size=4, gradient_accumulation=4
+```
+
+**显存详细拆解:**
+```
+模型参数:    3.44 GB
+优化器:     6.0 GB (ZeRO-2分区后)
+梯度:        1.5 GB (ZeRO-2分区后)
+激活值:      1.5 GB (micro_batch=4)
+其他开销:    1.0 GB
+─────────────────────
+训练相关:   13.44 GB
+
+原有进程:   16.5 GB (GPU 5) / 7.4 GB (GPU 9)
+PyTorch碎片: 12 GB (GPU 5) / 10.5 GB (GPU 9)
+─────────────────────
+实际占用:   43.9 GB (GPU 5) / 33.3 GB (GPU 9)
+```
+
+**DeepSpeed ZeRO-2效果:**
+```
+优化器节省: 12 GB (分区到2张卡)
+梯度节省:    3 GB (分区到2张卡)
+总节省:     15 GB
+```
+
+### 12.3 Batch配置对显存的影响
+
+```
+batch_size: 32 (全局)
+micro_batch_size: 4 (每张卡)
+gradient_accumulation: 32/(4×2) = 4步
+
+为什么micro_batch_size影响显存？
+  激活值 = 单样本激活 × micro_batch_size
+  micro_batch=4:  激活值 ≈ 0.71 GB
+  micro_batch=32: 激活值 ≈ 5.7 GB
+  节省: 5.0 GB
+
+为什么梯度累积不增加显存？
+  梯度张量大小固定（1.5B个参数）
+  只是数值累加，不是创建新张量
+  → 显存不增加
+```
+
+### 12.4 训练进度监控
+
+```bash
+# 查看训练日志
+tail -50 /data1/lyt/MiniOneRec/sft_train.log
+
+# 查看GPU状态
+watch -n 2 nvidia-smi
+```
+
+**训练状态示例:**
+```
+进度: 2897/7485 步 (38.7%)
+Epoch: 1.16 / 3.0
+Loss: 8.08 → 1.6 (下降80%)
+学习率: 6.15e-05 (余弦衰减中期)
+预计剩余: 2小时34分钟
+```
+
+---
+
+## 13. 常见问题补充（新增）
+
+### Q8: RQ-VAE训练集和.inter文件的过滤规则分别是什么？
+
+```
+RQ-VAE训练集 (.npy):
+  过滤规则: ❌ 无过滤
+  数据量: 3686条 (=物品数)
+  内容: 物品嵌入(2560维)
+  用途: 训练RQ-VAE生成SID
+
+.inter文件:
+  过滤规则: ✅ K-core + 时间 + 标题
+    - user_k=5, item_k=5
+    - 时间: 2016-10 ~ 2018-11
+    - 标题: 删除无标题/HTML/过长
+  数据量: 30万条 (=交互数)
+  内容: 用户交互序列
+  用途: 训练SFT学习推荐
+
+为什么不同？
+  RQ-VAE: 需要为"所有物品"生成SID，不能遗漏
+  .inter: 需要"高质量交互"，过滤冷启动用户/冷门物品
+```
+
+### Q9: 3686个物品是专门划分给RQ-VAE的吗？
+
+```
+❌ 不是专门划分的
+✅ 是整个数据集的全部物品
+
+3686 = K-core过滤后的物品总数
+  - RQ-VAE训练用全部3686个
+  - SFT训练也用全部3686个（通过用户行为）
+  - 推理时也是这3686个
+
+原因:
+  如果RQ-VAE只训练部分物品:
+    → 其他物品没有SID
+    → SFT训练中出现这些物品，无法处理
+    → 推理时想推荐这些物品，没有SID
+```
+
+### Q10: 为什么SFT训练集不需要去重？
+
+```
+因为SFT训练集使用的SID来自index.json
+而index.json在生成时已经去重了
+
+流程:
+  generate_indices.py → index.json (去重后，碰撞率0.30%)
+  convert_dataset.py 查index.json → CSV (SID已写入)
+  sft.py 读取CSV → 训练 (SID已唯一)
+
+SFT训练集"继承"了去重结果
+不需要再次去重
+```
+
+### Q11: RQ-VAE模型推理时还用吗？
+
+```
+❌ 不再使用！
+
+RQ-VAE的使命:
+  阶段1: 训练模型 (47分钟)
+  阶段2: 生成SID索引 (一次性)
+  阶段3: 退役
+
+SFT/RL/推理阶段:
+  只用SID字符串
+  不用RQ-VAE模型
+
+类比:
+  RQ-VAE = 印刷厂
+  SID索引 = 电话号码本
+  SFT模型 = 接线员
+  
+  接线员上岗后，不需要印刷厂了
+```
+
